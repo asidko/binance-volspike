@@ -1,0 +1,10 @@
+.venv
+.idea
+.env
+.cache
+.data
+tbot.pid
+*.log
+**/__pycache__/
+/src/nohup.out
+/*.pid
