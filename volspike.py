@@ -33,7 +33,31 @@ class SymbolAnalysisResult:
     symbol: str
     change_percent: float
     min_passed: int = 0
+    is_price_spike: bool = False
 
+BINANCE_INTERVALS_IN_MINUTES = [1, 3, 5, 15, 30, 60, 120, 240, 360, 480, 720, 1440, 10080, 43200]
+
+def convert_interval_to_minutes(interval: str) -> int:
+    multipliers = {'m': 1, 'h': 60, 'd': 1440, 'w': 10080, 'M': 43200, 'y': 525600}
+    return int(interval[:-1]) * multipliers.get(interval[-1], 0)
+
+def make_more_human_readable_interval_label(label: str) -> str:
+    transitions = {'m': ('h', 60), 'h': ('d', 24), 'd': ('M', 30)}
+    while label[-1] in transitions:
+        value, unit = int(label[:-1]), label[-1]
+        new_unit, divisor = transitions[unit]
+        if value % divisor == 0:
+            label = f"{value // divisor}{new_unit}"
+        else:
+            break
+    return label
+
+def round_to_available_interval_minutes(interval_minutes: int) -> int:
+    return min(BINANCE_INTERVALS_IN_MINUTES, key=lambda x: abs(x - interval_minutes))
+
+def normalize_timeframe_label(label: str) -> str:
+    return make_more_human_readable_interval_label(
+        str(round_to_available_interval_minutes(convert_interval_to_minutes(label))) + 'm')
 
 def parse_percentage(pct_str: str) -> float:
     try:
@@ -114,11 +138,11 @@ async def analyze_symbol(
         args: argparse.Namespace
 ) -> Optional[SymbolAnalysisResult]:
     try:
-
+        interval_limit = calculate_required_candles(args.range, args.interval)
         current_data = await fetch_json(session, KLINES_URL, {
             'symbol': symbol,
-            'interval': '15m',
-            'limit': "16"
+            'interval': f'{args.interval}',
+            'limit': f"{interval_limit}"
         })
 
         if not current_data:
@@ -127,9 +151,15 @@ async def analyze_symbol(
         if len(current_data) < 3:
             return None
 
-        volumes = [float(candle[5]) for candle in current_data]
-        volumes_last = [float(candle[5]) for candle in current_data[-3:]]
+        # Ignore last item because it's not complete (volume and price is still forming)
+        current_data = current_data[:-1]
 
+        volumes = [float(candle[5]) for candle in current_data]
+        if len(volumes) < 4:
+            return None
+
+        # Take last 3 volumes for comparison
+        volumes_last = volumes[-3:]
         volume_median = median(volumes)
         volume_last_min = min(volumes_last)
         change_percent = ((volume_last_min - volume_median) / volume_median) * 100
@@ -143,16 +173,25 @@ async def analyze_symbol(
 
 
         min_passed = 0
+        is_price_spike=False
         sustained_growth_index = find_sustained_growth(volumes, threshold=args.threshold/100, consecutive=3)
         if sustained_growth_index != -1:
             # count items from this index to the end
             count_items_after = len(volumes) - sustained_growth_index
-            min_passed = count_items_after * 15
+            min_passed = count_items_after * convert_interval_to_minutes(args.interval)
+            # average diff between max and min of prices
+            avg_minmax_before_list = [abs(float(candle[2]) - float(candle[3])) for candle in current_data[:sustained_growth_index]]
+            avg_minmax_after_list = [abs(float(candle[2]) - float(candle[3])) for candle in current_data[sustained_growth_index:]]
+            avg_minmax_before,avg_minmax_after = mean(avg_minmax_before_list), mean(avg_minmax_after_list)
+            price_change_threshold_ratio = 0.25
+            is_price_spike = avg_minmax_after > avg_minmax_before * price_change_threshold_ratio
+
 
         return SymbolAnalysisResult(
             symbol=symbol,
             change_percent=change_percent,
-            min_passed=min_passed
+            min_passed=min_passed,
+            is_price_spike=is_price_spike
         )
     except Exception:
         return None
@@ -186,8 +225,9 @@ def create_table(results: List[SymbolAnalysisResult], last_updated: str, args: a
         percent = round(res.change_percent)
         min_passed = res.min_passed
         time_passed = minutes_to_human_readable(min_passed)
+        is_price_spike = res.is_price_spike
 
-        symbol_display = f"{symbol}"
+        symbol_display = f"[bright_cyan]{symbol}[/bright_cyan]" if is_price_spike else f"{symbol}"
         parent_display = f"[green]{percent}[/green]%" if percent > 0 else f"[red]{percent}[/red]%"
         time_passed_display = "-" if min_passed <= 0 else f"[green]{time_passed}[green]" if min_passed < 60 else f"[red]{time_passed}[/red]"
         table.add_row(symbol_display, parent_display, time_passed_display)
@@ -200,7 +240,8 @@ def minutes_to_human_readable(minutes):
     return f"{d}d " * (d > 0) + f"{h}h " * (h > 0) + f"{m}m" * (m > 0) or "0m"
 
 async def main(args: argparse.Namespace):
-    console.print(f"\n[bold]Searching for volumes...\n")
+    range = normalize_timeframe_label(args.range)
+    console.print(f"\nSearching for symbols. Analysing volume on [yellow]{args.interval}[/yellow] intervals of [yellow]{range}[/yellow] range. Looking for [magenta]{args.threshold}%[/magenta] spikes!\n")
 
     async with aiohttp.ClientSession() as session:
         # Fetching symbol list
@@ -248,19 +289,22 @@ async def main(args: argparse.Namespace):
             if not args.watch:
                 break
 
-            await asyncio.sleep(args.interval)
+            await asyncio.sleep(args.wait)
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Analyze volume changes of USDT coins on Binance Futures.')
+    parser.add_argument('--interval', type=str, default="15m", help='Timeframe for volume analysis (e.g. 15m, 1h, 4h, 1d)')
+    parser.add_argument('--range', type=str, default="6h", help='Time range for volume analysis (e.g. 4h, 1d, 3d)')
     parser.add_argument('--watch', action='store_true', help='Continuous monitoring mode')
     parser.add_argument('--threshold', type=str, default="50%", help='Volume change threshold, by default filter everything without 50% spikes')
-    parser.add_argument('--interval', type=int, default=30, help='Interval for continuous monitoring mode')
+    parser.add_argument('--wait', type=int, default=30, help='Interval for continuous monitoring mode')
     parser.add_argument('--count', type=int, default=12, help='Number of top symbols to display')
     args = parser.parse_args()
 
     args.max_concurrency = MAX_CONCURRENCY
+    args.interval = normalize_timeframe_label(args.interval)
     args.threshold = parse_percentage(args.threshold)
 
     try:
